@@ -33,6 +33,7 @@ OUTBOUND_ETHERNET = "nic_ethernet"
 OUTBOUND_WIFI = "nic_wifi"
 OUTBOUND_AGGREGATION = "aggregation"
 OUTBOUND_DIRECT = "direct"
+OUTBOUND_UDP_PRIMARY = "udp-primary"
 
 # 合法出站标签集合（用于校验用户表格输入）
 VALID_OUTBOUNDS = {
@@ -89,6 +90,7 @@ def build_config(
     dns_bind_ip: str = "",
     dns_bind_interface: str = "",
     app_process_path: str | List[str] = "",
+    selected_nics: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """根据用户规则动态构建 sing-box 配置字典。
 
@@ -96,6 +98,9 @@ def build_config(
         rules: 规则列表，每项 {"process_name": [...], "outbound": "<tag>"}。
                兼容单字符串 process_name；非法/空规则会被安全跳过。
         default_outbound: 兜底出站标签（默认 aggregation 聚合叠加）。
+        selected_nics: 用户选中的网卡列表（含 priority/alias 字段）。
+               用于判定 UDP 出口网卡 — 取最高优先级 NIC 的 alias
+               作为 bind_interface，未传入时 UDP 走系统默认路由。
 
     Returns:
         dict: 可直接 json.dump 的 sing-box 配置。
@@ -105,6 +110,25 @@ def build_config(
         rule = _normalize_rule(raw)
         if rule is not None:
             user_route_rules.append(rule)
+
+    # ── UDP 出口选择：取最高优先级网卡的 alias 作为 bind_interface ──
+    udp_outbound_tag = OUTBOUND_DIRECT
+    udp_direct_outbound: Optional[Dict[str, Any]] = None
+    if selected_nics:
+        best = min(
+            selected_nics,
+            key=lambda n: int(n.get("priority", 1) or 1),
+            default=None,
+        )
+        if best is not None:
+            alias = str(best.get("name", best.get("alias", ""))).strip()
+            if alias:
+                udp_outbound_tag = OUTBOUND_UDP_PRIMARY
+                udp_direct_outbound = {
+                    "type": "direct",
+                    "tag": OUTBOUND_UDP_PRIMARY,
+                    "bind_interface": alias,
+                }
 
     defensive_route_rules: List[Dict[str, Any]] = []
     defensive_route_rules.append({
@@ -139,7 +163,7 @@ def build_config(
         },
         {"port": [53], "action": "hijack-dns"},
         {"protocol": ["dns"], "action": "hijack-dns"},
-        {"network": ["udp"], "action": "route", "outbound": "direct"},
+        {"network": ["udp"], "action": "route", "outbound": udp_outbound_tag},
     ])
     route_rules = defensive_route_rules + user_route_rules
 
@@ -158,6 +182,8 @@ def build_config(
         _socks_outbound(OUTBOUND_AGGREGATION, aggregation_port),
         {"type": "direct", "tag": OUTBOUND_DIRECT},
     ]
+    if udp_direct_outbound is not None:
+        outbounds.append(udp_direct_outbound)
     for tag in dynamic_outbound_tags:
         outbounds.append(_socks_outbound(tag, _dynamic_nic_port(tag)))
 

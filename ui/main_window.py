@@ -941,6 +941,7 @@ def create_main_window():
                     self._routing_rules,
                     config_path,
                     app_process_path=self._app_process_paths(),
+                    selected_nics=self.get_selected_adapters(),
                 )
                 if ok:
                     self._app_config["_singbox_config_hash"] = current_fp
