@@ -16,6 +16,8 @@ QApplication 已存在，避免 "Must construct a QApplication before a QWidget"
 """
 
 import ctypes
+import hashlib
+import json
 import logging
 import subprocess
 import sys
@@ -25,7 +27,7 @@ from typing import List, Dict
 import winreg
 
 from utils.network_utils import scan_network_adapters
-from utils.config_manager import load_config, save_config
+from utils.config_manager import load_config, save_config, get_adapter_priority, set_adapter_priority
 from utils.diagnostic_runner import run_diagnostic, DEFAULT_TARGET_IP
 from proxy_worker import ProxyWorker, MultiPortProxyWorker
 from utils.tun_manager import TunManager
@@ -167,6 +169,33 @@ def _first_valid_ipv4(raw) -> str:
     return ""
 
 
+def _compute_config_fingerprint(
+    selected_nics: List[Dict],
+    routing_rules: List[Dict],
+    app_paths: List[str],
+) -> str:
+    """计算 sing-box 配置输入的指纹（SHA-256 前 16 位 hex）。
+
+    只有 NIC 选择（alias + priority）、路由规则或宿主进程路径变更时，
+    指纹才会变化，触发 config.json 重新生成。手动编辑 config.json 后
+    只要输入不变，指纹匹配，不会被覆盖。
+    """
+    nic_sig = sorted(
+        [
+            (n.get("alias", n.get("name", "")), n.get("priority", 1))
+            for n in (selected_nics or [])
+        ],
+        key=lambda x: x[0],
+    )
+    data = {
+        "nics": nic_sig,
+        "rules": routing_rules or [],
+        "app_paths": sorted(app_paths or []),
+    }
+    raw = json.dumps(data, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
 def create_main_window():
     """工厂函数：创建 MainWindow 实例（此时 QApplication 已存在）"""
     from PySide6.QtCore import Qt, QThread, Signal, Slot, QTimer, QSettings, QRect, QRectF, QPoint
@@ -274,6 +303,8 @@ def create_main_window():
             "log_steam_running": "[警告] 检测到 Steam 正在运行，请重启 Steam 客户端以使多链路加速完全生效。",
             "log_mode_changed": "[模式] 已切换为 {mode}",
             "log_tun_config_failed": "[TUN] 生成 sing-box 配置失败: {error}",
+            "log_tun_config_exists": "[TUN] sing-box 配置已存在，跳过自动生成: {path}",
+            "log_tun_config_created": "[TUN] sing-box 配置已生成: {path}",
             "log_tun_dns_plan": "[TUN] DNS 上游: 系统自动出口 | 进程直连规则: {paths}",
             "log_tun_pool_ready": "[TUN] 出站池 ready: {info}",
             "log_tun_pool_failed": "[TUN] 出站池启动失败: {message}",
@@ -301,6 +332,8 @@ def create_main_window():
             "log_steam_running": "[Warning] Steam is running. Please restart the Steam client for multi-link acceleration to take full effect.",
             "log_mode_changed": "[Mode] Switched to {mode}",
             "log_tun_config_failed": "[TUN] Failed to generate sing-box config: {error}",
+            "log_tun_config_exists": "[TUN] sing-box config already exists, skipping auto-generation: {path}",
+            "log_tun_config_created": "[TUN] sing-box config generated: {path}",
             "log_tun_dns_plan": "[TUN] DNS upstream: automatic system outbound | Process direct rules: {paths}",
             "log_tun_pool_ready": "[TUN] Outbound pool ready: {info}",
             "log_tun_pool_failed": "[TUN] Outbound pool startup failed: {message}",
@@ -578,6 +611,7 @@ def create_main_window():
             self.home_page.deselect_all_clicked.connect(self.on_deselect_all_clicked)
             self.home_page.refresh_clicked.connect(self.load_adapters)
             self.home_page.adapter_checked.connect(self.on_adapter_checked)
+            self.home_page.adapter_priority_changed.connect(self.on_adapter_priority_changed)
             self.home_page.mode_changed.connect(self.on_mode_changed)
             # 工具页（任务2：体检页也能勾选网卡，并入选择流）
             self.tools_page.start_clicked.connect(self.on_diagnose_clicked)
@@ -692,6 +726,8 @@ def create_main_window():
                 "routing_rules": self._routing_rules,
                 "dns_server": self._app_config.get("dns_server", "223.5.5.5"),
                 "doh_provider": self._app_config.get("doh_provider", "auto"),
+                "adapter_priorities": self._app_config.get("adapter_priorities", {}),
+                "_singbox_config_hash": self._app_config.get("_singbox_config_hash", ""),
             }
 
         def _persist_config(self):
@@ -710,6 +746,16 @@ def create_main_window():
             self.home_page.set_card_checked(alias, checked)
             self.tools_page.set_card_checked(alias, checked)
             self._persist_config()
+
+        def on_adapter_priority_changed(self, alias: str, priority: int):
+            """网卡优先级变更时立即持久化（加速中不允许修改，由 UI 层锁定控件）。"""
+            set_adapter_priority(alias, priority)
+            # 同步更新内存中的配置缓存
+            priorities = self._app_config.get("adapter_priorities", {})
+            if not isinstance(priorities, dict):
+                priorities = {}
+            priorities[alias] = priority
+            self._app_config["adapter_priorities"] = priorities
 
         def on_select_all_clicked(self):
             self._checked_aliases = {a["alias"] for a in self._adapters}
@@ -741,6 +787,7 @@ def create_main_window():
                     "iftype": a.get("iftype", -1),
                     "is_ppp": bool(a.get("is_ppp", False)),
                     "metric": a.get("metric", -1),
+                    "priority": get_adapter_priority(a["alias"]),
                 })
             return selected
 
@@ -767,6 +814,7 @@ def create_main_window():
             # 预先为每张网卡补一个 'ip' 字段（首个有效 IPv4），供卡片显示
             for a in self._adapters:
                 a["ip"] = _first_valid_ipv4(a.get("ipv4", ""))
+                a["priority"] = get_adapter_priority(a["alias"])
             # 仅保留仍存在的勾选别名
             existing = {a["alias"] for a in self._adapters}
             self._checked_aliases &= existing
@@ -872,13 +920,33 @@ def create_main_window():
             return str(config_dir / "singbox-config.json")
 
         def _regenerate_singbox_config(self) -> bool:
-            """据当前路由规则重新序列化 sing-box config.json。"""
+            """当 NIC 选择/路由规则/进程路径变更时重新生成 sing-box config.json；
+            若输入未变且文件已存在则原样使用（支持手动编辑 config.json）。"""
+            config_path = self._singbox_config_path()
+
+            current_fp = _compute_config_fingerprint(
+                self.get_selected_adapters(),
+                self._routing_rules,
+                self._app_process_paths(),
+            )
+            stored_fp = self._app_config.get("_singbox_config_hash", "")
+
+            # 文件存在 + 指纹匹配 → 输入未变，保留现有配置（含手动修改）
+            if Path(config_path).is_file() and current_fp == stored_fp:
+                self.append_log(mw_tr("log_tun_config_exists", path=config_path))
+                return True
+
             try:
-                return singbox_config.generate_config_file(
+                ok = singbox_config.generate_config_file(
                     self._routing_rules,
-                    self._singbox_config_path(),
+                    config_path,
                     app_process_path=self._app_process_paths(),
                 )
+                if ok:
+                    self._app_config["_singbox_config_hash"] = current_fp
+                    self._persist_config()
+                    self.append_log(mw_tr("log_tun_config_created", path=config_path))
+                return ok
             except Exception as e:
                 self.append_log(mw_tr("log_tun_config_failed", error=e))
                 return False

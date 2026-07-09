@@ -8,7 +8,7 @@ HypoMux 首页数据看板 (HomePage)
 from typing import Dict, List
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QFrame, QSizePolicy
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QFrame, QSizePolicy, QSpinBox
 from qfluentwidgets import (
     ElevatedCardWidget, SwitchButton, TitleLabel, StrongBodyLabel,
     BodyLabel, CaptionLabel, SubtitleLabel, DisplayLabel, CheckBox,
@@ -38,6 +38,7 @@ class AdapterRow(QWidget):
     """扁平化网卡行。"""
 
     toggled = Signal(str, bool)
+    priority_changed = Signal(str, int)
 
     def __init__(self, adapter: Dict, parent=None):
         super().__init__(parent)
@@ -65,6 +66,16 @@ class AdapterRow(QWidget):
         self._ip_label.setMinimumWidth(150)
         self._speed_label = BodyLabel(tr("home_row_traffic", speed=0.0, conn=0), self)
         self._speed_label.setMinimumWidth(180)
+
+        # 优先级微调框
+        self._priority_spin = QSpinBox(self)
+        self._priority_spin.setRange(1, 10)
+        self._priority_spin.setValue(int(adapter.get("priority", 1) or 1))
+        self._priority_spin.setToolTip(tr("home_priority_tip"))
+        self._priority_spin.setFixedWidth(50)
+        self._priority_spin.valueChanged.connect(self._on_priority_changed)
+        self._priority_label = CaptionLabel(tr("home_priority_label"), self)
+
         self._health_badge = InfoBadge.info(tr("home_health_unknown"), self)
 
         layout.addWidget(self.checkbox)
@@ -72,6 +83,8 @@ class AdapterRow(QWidget):
         layout.addWidget(self._name_label, 2)
         layout.addWidget(self._ip_label, 2)
         layout.addWidget(self._speed_label, 2)
+        layout.addWidget(self._priority_label)
+        layout.addWidget(self._priority_spin)
         layout.addStretch()
         layout.addWidget(self._health_badge, 0, Qt.AlignRight)
         self._apply_active_style(False)
@@ -83,6 +96,19 @@ class AdapterRow(QWidget):
     def _on_toggled(self, checked: bool):
         self._apply_active_style(checked)
         self.toggled.emit(self._alias, checked)
+
+    def _on_priority_changed(self, value: int):
+        self.priority_changed.emit(self._alias, value)
+
+    def set_priority(self, priority: int):
+        """外部设置优先级（如跨屏同步），阻断信号避免循环触发。"""
+        self._priority_spin.blockSignals(True)
+        self._priority_spin.setValue(max(1, min(10, int(priority or 1))))
+        self._priority_spin.blockSignals(False)
+
+    def set_priority_enabled(self, enabled: bool):
+        """加速中锁定优先级控件。"""
+        self._priority_spin.setEnabled(enabled)
 
     def set_checked(self, checked: bool):
         self.checkbox.blockSignals(True)
@@ -131,6 +157,8 @@ class AdapterRow(QWidget):
             speed=self._last_speed_mbps,
             conn=self._last_connections,
         ))
+        self._priority_label.setText(tr("home_priority_label"))
+        self._priority_spin.setToolTip(tr("home_priority_tip"))
         self.update_health(self._last_status or "")
 
 
@@ -185,6 +213,7 @@ class HomePage(QWidget):
     deselect_all_clicked = Signal()
     refresh_clicked = Signal()
     adapter_checked = Signal(str, bool)
+    adapter_priority_changed = Signal(str, int)
     mode_changed = Signal(str)
 
     def __init__(self, parent=None):
@@ -370,6 +399,7 @@ class HomePage(QWidget):
                 row.set_checked(True)
             row.checkbox.setEnabled(self._adapter_controls_enabled)
             row.toggled.connect(self.adapter_checked.emit)
+            row.priority_changed.connect(self.adapter_priority_changed.emit)
             self._rows_layout.addWidget(row)
             self._cards[row.alias] = row
             if index < len(adapters) - 1:
@@ -459,6 +489,7 @@ class HomePage(QWidget):
         self._rows_host.setEnabled(enabled)
         for row in self._cards.values():
             row.checkbox.setEnabled(enabled)
+            row.set_priority_enabled(enabled)
 
     def set_controls_enabled(self, enabled: bool):
         self.mode_segment.setEnabled(enabled)

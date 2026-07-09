@@ -77,6 +77,8 @@ def default_config() -> Dict[str, Any]:
         "routing_rules": [],
         "dns_server": DEFAULT_DNS_SERVER,
         "doh_provider": DEFAULT_DOH_PROVIDER,
+        # 网卡优先级：key=网卡别名，value=优先级（1最高，默认1=均等）
+        "adapter_priorities": {},
     }
 
 
@@ -124,6 +126,20 @@ def _coerce_config(raw: Any) -> Dict[str, Any]:
 
     raw_doh = str(raw.get("doh_provider", DEFAULT_DOH_PROVIDER)).strip().lower()
     cfg["doh_provider"] = raw_doh if raw_doh in VALID_DOH_PROVIDERS else DEFAULT_DOH_PROVIDER
+
+    # adapter_priorities：必须是 Dict[str, int]，值在 1-10 范围内
+    raw_priorities = raw.get("adapter_priorities")
+    if isinstance(raw_priorities, dict):
+        cfg["adapter_priorities"] = {}
+        for alias, prio in raw_priorities.items():
+            if not isinstance(alias, str) or not alias.strip():
+                continue
+            try:
+                p = int(prio)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= p <= 10:
+                cfg["adapter_priorities"][alias.strip()] = p
 
     return cfg
 
@@ -230,3 +246,59 @@ def save_config(config: Dict[str, Any]) -> bool:
     except Exception as e:
         logger.warning(f"保存配置发生未知异常: {e}")
         return False
+
+
+# ---------------------------------------------------------------------------
+# 便捷读写方法（供 UI 层使用，避免到处写 load_config / save_config 样板代码）
+# ---------------------------------------------------------------------------
+
+def get_adapter_priority(alias: str) -> int:
+    """读取指定网卡的优先级，未设置则返回默认值 1（所有网卡均等）。
+
+    Args:
+        alias: 网卡别名（如 "以太网"、"WLAN"）。
+
+    Returns:
+        int: 优先级 1~10，1 最高。
+    """
+    cfg = load_config()
+    priorities = cfg.get("adapter_priorities", {})
+    if not isinstance(priorities, dict):
+        return 1
+    value = priorities.get(alias.strip(), 1)
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return 1
+    if 1 <= value <= 10:
+        return value
+    return 1
+
+
+def set_adapter_priority(alias: str, priority: int) -> bool:
+    """设置指定网卡的优先级并持久化。
+
+    Args:
+        alias: 网卡别名。
+        priority: 优先级 1~10，1 最高。
+
+    Returns:
+        bool: True 表示写入成功。
+    """
+    alias = alias.strip()
+    if not alias:
+        return False
+    try:
+        priority = int(priority)
+    except (TypeError, ValueError):
+        return False
+    if not (1 <= priority <= 10):
+        return False
+
+    cfg = load_config()
+    priorities = cfg.get("adapter_priorities", {})
+    if not isinstance(priorities, dict):
+        priorities = {}
+    priorities[alias] = priority
+    cfg["adapter_priorities"] = priorities
+    return save_config(cfg)
