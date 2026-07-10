@@ -21,6 +21,7 @@ HypoMux 代理后端模块 - v2.0（SOCKS5 + HTTP 双协议无感接管）
 
 import asyncio
 import ctypes
+import ipaddress
 import ssl
 import random
 import socket
@@ -35,6 +36,18 @@ import psutil
 from PySide6.QtCore import QThread, Signal
 
 from utils.network_utils import get_adapter_if_indices
+
+
+def _is_public_ipv4(ip: str) -> bool:
+    """判断 IP 是否为公网地址（仅公网地址的连通失败才计入网卡健康扣分）。
+
+    非公网地址（RFC 1918 私有、APIPA 链路本地、CGNAT、回环、组播、保留地址等）
+    的跨子网连接失败属于正常现象，不应归咎网卡。
+    """
+    try:
+        return ipaddress.IPv4Address(ip).is_global
+    except (ValueError, ipaddress.AddressValueError):
+        return False
 
 
 def _is_winerror6_overlapped_cancel(context: dict) -> bool:
@@ -138,6 +151,214 @@ class RoundRobinBalancer:
         with self._lock:
             return dict(self._active)
 
+    def report_result(self, nic_name: str, success: bool,
+                      dst_addr: str = "", dst_port: int = 0):
+        """兼容 PriorityBalancer 的健康上报接口（普通轮询下为空操作）。"""
+        pass
+
+
+# ---------------------------------------------------------------------------
+# 网卡健康追踪器（供 PriorityBalancer 内部使用）
+# ---------------------------------------------------------------------------
+class _NicHealth:
+    """单张网卡的连接健康状态，基于滑动窗口 + 自动降级/恢复。"""
+
+    __slots__ = ('_results', '_position', '_demoted_until', '_cooldown_multiplier')
+
+    WINDOW = 16          # 滑动窗口大小（加大以减少偶然失败的影响）
+    FAIL_THRESHOLD = 8   # 窗口内失败 >= 此值触发降级（保持 50% 阈值但更大样本）
+    BASE_COOLDOWN = 30.0 # 基础冷却时间（秒）
+
+    def __init__(self):
+        # True=成功, False=失败；初始填满成功（乐观启动）
+        self._results: List[bool] = [True] * self.WINDOW
+        self._position = 0
+        self._demoted_until: float = 0.0
+        self._cooldown_multiplier = 1
+
+    def record(self, success: bool):
+        """记录一次连接结果。"""
+        self._results[self._position % self.WINDOW] = bool(success)
+        self._position += 1
+
+    def is_healthy(self, now: float) -> bool:
+        """判断网卡当前是否健康可用。
+
+        规则：
+        1. 处于冷却期内 → 不可用
+        2. 冷却期刚结束 → 重置状态并给予一次机会
+        3. 滑动窗口内失败数 >= 阈值 → 进入冷却期
+        """
+        if now < self._demoted_until:
+            return False
+
+        # 冷却期已过 → 重置窗口，给网卡一次恢复机会
+        if self._demoted_until > 0:
+            self._results = [True] * self.WINDOW
+            self._demoted_until = 0.0
+            return True
+
+        failures = sum(1 for r in self._results if not r)
+        if failures >= self.FAIL_THRESHOLD:
+            cooldown = self.BASE_COOLDOWN * self._cooldown_multiplier
+            self._demoted_until = now + cooldown
+            self._cooldown_multiplier = min(self._cooldown_multiplier * 2, 8)
+            return False
+
+        # 健康 → 逐步回退冷却倍数
+        if self._cooldown_multiplier > 1:
+            self._cooldown_multiplier = max(1, self._cooldown_multiplier - 1)
+        return True
+
+
+# ---------------------------------------------------------------------------
+# 优先级 + 自适应健康检测均衡器
+# ---------------------------------------------------------------------------
+class PriorityBalancer:
+    """按用户设定的优先级选择网卡，并结合实时健康检测自动溢出。
+
+    与 RoundRobinBalancer 的区别：
+    - 网卡按 priority 升序排列（1 最高优先）
+    - 采用「近期分配衰减」算法：每次选中网卡时记录一笔，计数按 5 秒半衰期指数衰减。
+      score = weight / (1 + recent_alloc)，近期分配越多的网卡 score 越低。
+    - 高优先级网卡连接失败过多时自动降级冷却，被跳过直到恢复
+    - 全部网卡不健康时退化为轮询（兜底）
+    - 所有优先级相同时等价于带健康检测的 RoundRobinBalancer
+
+    设计要点：分母用「近期分配次数」而非「活跃连接数」。
+    活跃连接数受连接持续时间影响——饱和网卡上的连接持久不释放会导致
+    该网卡被永久冷落。近期分配次数只关心「最近给了多少」，5 秒后自动
+    衰减，确保饱和网卡在连接释放后能快速恢复分配资格。
+    """
+
+    # 近期分配计数的半衰期（秒）：5 秒后计数减半
+    ALLOC_HALF_LIFE = 5.0
+
+    def __init__(self, selected_nics: List[Dict]):
+        if not selected_nics:
+            raise ValueError("PriorityBalancer 至少需要 1 张网卡")
+        self.nics: List[Dict] = sorted(
+            [dict(nic) for nic in selected_nics],
+            key=lambda n: int(n.get("priority", 1) or 1),
+        )
+        self._lock = threading.Lock()
+        self._active: Dict[str, int] = {nic["name"]: 0 for nic in self.nics}
+        self._health: Dict[str, _NicHealth] = {
+            nic["name"]: _NicHealth() for nic in self.nics
+        }
+        self._weights: Dict[str, float] = {
+            nic["name"]: 1.0 / max(1, int(nic.get("priority", 1) or 1))
+            for nic in self.nics
+        }
+        # 近期分配计数（指数衰减），替代 active_connections 用于 score 计算
+        self._recent_alloc: Dict[str, float] = {nic["name"]: 0.0 for nic in self.nics}
+        self._last_decay: float = time.monotonic()
+        # 全部网卡不健康时的轮询兜底
+        self._fallback_index = 0
+        # 目标级失败去重缓存：(dst_addr, dst_port) → 最近失败时间戳
+        # 同一目标 10s 内在任意网卡上失败过 → 不重复扣健康分（目标问题非 NIC 故障）
+        self._failure_cache: Dict[Tuple[str, int], float] = {}
+
+    def _decay_all_locked(self, now: float):
+        """对所有网卡的近期分配计数施加指数衰减（需在持有 _lock 时调用）。"""
+        elapsed = now - self._last_decay
+        if elapsed <= 0.05:  # 50ms 内不重复衰减，减少浮点运算
+            return
+        # decay = 0.5^(elapsed / half_life)
+        decay = 0.5 ** (elapsed / self.ALLOC_HALF_LIFE)
+        for name in self._recent_alloc:
+            self._recent_alloc[name] *= decay
+        self._last_decay = now
+
+    def get_next_nic(self) -> Dict:
+        """近期分配衰减调度。
+
+        对每张健康网卡计算 score = weight / (1 + recent_alloc)，
+        返回 score 最高的网卡。recent_alloc 按 5 秒半衰期自动衰减，
+        确保饱和网卡最多被跳过数秒而非永久冷落。
+        """
+        with self._lock:
+            now = time.monotonic()
+            self._decay_all_locked(now)
+            best_nic = None
+            best_score = -1.0
+            all_unhealthy = True
+
+            for nic in self.nics:
+                name = nic["name"]
+                if not self._health[name].is_healthy(now):
+                    continue
+                all_unhealthy = False
+                weight = self._weights.get(name, 1.0)
+                recent = self._recent_alloc.get(name, 0.0)
+                score = weight / (1.0 + recent)
+                if score > best_score:
+                    best_score = score
+                    best_nic = nic
+
+            if best_nic is not None:
+                # 不在分配时递增 _recent_alloc，改由 report_result(success=True) 递增。
+                # 避免 GFW 封锁 / 目标不可达导致的必然失败也拉高计数、
+                # 使网卡 score 被错误压低。
+                return best_nic
+
+            # 全部不健康 → 轮询兜底
+            nic = self.nics[self._fallback_index]
+            self._fallback_index = (self._fallback_index + 1) % len(self.nics)
+            return nic
+
+    # 目标级失败缓存配置
+    FAILURE_CACHE_TTL = 10.0    # 同一目标失败去重有效期（秒）
+    FAILURE_CACHE_MAX = 200     # 缓存条目上限（LRU 淘汰）
+
+    def report_result(self, nic_name: str, success: bool,
+                      dst_addr: str = "", dst_port: int = 0):
+        """上报一次连接结果。
+        
+        成功时递增 _recent_alloc（权重计数），并清除目标失败缓存。
+        失败时先检查目标级去重缓存：同一 (addr,port) 在 TTL 内已失败过
+        则视为目标端问题，跳过 NIC 健康扣分；否则记录失败并写入缓存。
+        """
+        with self._lock:
+            if success:
+                # 成功 → 权重计数 + 清除目标失败记录
+                if nic_name in self._recent_alloc:
+                    self._recent_alloc[nic_name] += 1.0
+                if dst_addr and dst_port:
+                    self._failure_cache.pop((dst_addr, dst_port), None)
+                hs = self._health.get(nic_name)
+                if hs is not None:
+                    hs.record(True)
+            else:
+                # 失败 → 目标级去重
+                if dst_addr and dst_port:
+                    now = time.monotonic()
+                    key = (dst_addr, dst_port)
+                    last_fail = self._failure_cache.get(key)
+                    if last_fail is not None and (now - last_fail) <= self.FAILURE_CACHE_TTL:
+                        return  # 目标端故障，非 NIC 问题，跳过健康扣分
+                    # 写入缓存（满时淘汰最旧条目）
+                    if len(self._failure_cache) >= self.FAILURE_CACHE_MAX:
+                        oldest = min(self._failure_cache, key=self._failure_cache.get)  # type: ignore[arg-type]
+                        del self._failure_cache[oldest]
+                    self._failure_cache[key] = now
+                hs = self._health.get(nic_name)
+                if hs is not None:
+                    hs.record(False)
+
+    def on_connect(self, nic_name: str):
+        with self._lock:
+            self._active[nic_name] = self._active.get(nic_name, 0) + 1
+
+    def on_disconnect(self, nic_name: str):
+        with self._lock:
+            if self._active.get(nic_name, 0) > 0:
+                self._active[nic_name] -= 1
+
+    def active_connections(self) -> Dict[str, int]:
+        with self._lock:
+            return dict(self._active)
+
 
 # ==========================================
 # ProxyWorker：asyncio SOCKS5 内核的 QThread 封装
@@ -182,7 +403,7 @@ class ProxyWorker(QThread):
         self._listen_port = listen_port
         self._http_port = http_port if http_port is not None else listen_port + 1
 
-        self.balancer = RoundRobinBalancer(self._selected_nics)
+        self.balancer = PriorityBalancer(self._selected_nics)
 
         # 以下三个对象都在子线程的 asyncio loop 内创建/使用
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -579,10 +800,16 @@ class ProxyWorker(QThread):
             # 5. 连接目标
             try:
                 await loop.sock_connect(upstream_sock, (dst_addr, dst_port))
+                if nic is not None:
+                    self.balancer.report_result(nic["name"], True, dst_addr, dst_port)
             except Exception as e:
                 if nic is None:
                     pass
                 else:
+                    # 非公网地址的跨子网失败不扣健康分：不是网卡故障，
+                    # 而是目标本身只存在于另一张网的子网内。
+                    if _is_public_ipv4(dst_addr):
+                        self.balancer.report_result(nic["name"], False, dst_addr, dst_port)
                     self.log_signal.emit(
                         f"[连通失败] 网卡: {nic['name']} 无法连接目标 {target_display}: {e}"
                     )
@@ -774,8 +1001,13 @@ class ProxyWorker(QThread):
 
         try:
             await loop.sock_connect(upstream_sock, (dst_addr, dst_port))
+            if nic is not None:
+                self.balancer.report_result(nic["name"], True, dst_addr, dst_port)
         except Exception:
             if nic is not None:
+                # 非公网地址失败不扣 NIC 健康分（非网卡故障）
+                if _is_public_ipv4(dst_addr):
+                    self.balancer.report_result(nic["name"], False, dst_addr, dst_port)
                 self.balancer.on_disconnect(nic["name"])
             upstream_sock.close()
             self._upstream_sockets.discard(upstream_sock)
@@ -1067,9 +1299,9 @@ class MultiPortProxyWorker(QThread):
         self._wifi = wifi or self._selected_nics
 
         # 每个端口一个独立 balancer
-        self.bal_ethernet = RoundRobinBalancer(self._wired)
-        self.bal_wifi = RoundRobinBalancer(self._wifi)
-        self.bal_aggregation = RoundRobinBalancer(self._selected_nics)
+        self.bal_ethernet = PriorityBalancer(self._wired)
+        self.bal_wifi = PriorityBalancer(self._wifi)
+        self.bal_aggregation = PriorityBalancer(self._selected_nics)
         # 复用 ProxyWorker._traffic_monitor 需要 self.balancer.active_connections()，
         # 这里提供一个合并三通道实时连接数的轻量聚合视图。
         self.balancer = _MergedBalancerView(
@@ -1652,7 +1884,11 @@ class MultiPortProxyWorker(QThread):
                     loop.sock_connect(upstream_sock, (dst_addr, dst_port)),
                     timeout=self.TCP_CONNECT_TIMEOUT,
                 )
+                balancer.report_result(nic["name"], True, dst_addr, dst_port)
             except Exception as e:
+                # 非公网地址失败不扣 NIC 健康分（非网卡故障）
+                if _is_public_ipv4(dst_addr):
+                    balancer.report_result(nic["name"], False, dst_addr, dst_port)
                 self.log_signal.emit(
                     f"[出站池-{channel}][连通失败] {nic['name']} -> {target_display}:{dst_port} "
                     f"({dst_addr}) | {type(e).__name__}: {e}"
