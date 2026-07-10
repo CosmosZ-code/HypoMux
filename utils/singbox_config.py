@@ -22,6 +22,7 @@ sing-box 兼容 config.json。
 from __future__ import annotations
 
 import json
+import ipaddress
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -48,8 +49,11 @@ PORT_WIFI = 2002
 PORT_AGGREGATION = 2003
 
 TUN_INTERFACE_NAME = "HypoMux-Tun"
+TUN_GATEWAY = "172.19.0.1"
+TUN_ADDRESS = f"{TUN_GATEWAY}/30"
 DNS_LOCAL_TAG = "dns-local"
 DNS_FAKEIP_TAG = "dns-fakeip"
+SINGBOX_EXE = "sing-box.exe"
 
 
 def _socks_outbound(tag: str, port: int) -> Dict[str, Any]:
@@ -133,7 +137,7 @@ def build_config(
         },
         {
             "process_name": [
-                "sing-box.exe",
+                SINGBOX_EXE,
             ],
             "outbound": OUTBOUND_DIRECT,
         },
@@ -190,7 +194,7 @@ def build_config(
                 "type": "tun",
                 "tag": "tun-in",
                 "interface_name": tun_name,
-                "address": ["172.19.0.1/30"],
+                "address": [TUN_ADDRESS],
                 "mtu": 1492,
                 "auto_route": True,
                 "strict_route": True,
@@ -264,3 +268,43 @@ def generate_config_file(
 ) -> bool:
     """便捷入口：构建 + 写入一步到位。"""
     return write_config(build_config(rules, **kwargs), path)
+
+
+def read_tun_gateway(config_path: str | Path = "") -> str:
+    """从 singbox-config.json 提取 TUN 网关 IP，文件缺失/损坏时回退默认值。
+
+    供路由清理代码使用：用户可能手动修改 config 中的 TUN 地址，
+    清理残留路由时必须使用与 sing-box 实际运行一致的网关地址。
+    """
+    path = Path(config_path) if config_path else _default_config_path()
+    if not path.is_file():
+        return TUN_GATEWAY
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+        addr = config["inbounds"][0]["address"][0]  # e.g. "172.19.0.1/30"
+        return addr.split("/")[0]
+    except Exception:
+        return TUN_GATEWAY
+
+
+def _default_config_path() -> Path:
+    return Path.home() / ".hypomux" / "singbox-config.json"
+
+
+def read_fakeip_range(config_path: str | Path = "") -> "ipaddress.IPv4Network":
+    """从 singbox-config.json 提取 FakeIP 范围，文件缺失时回退默认值。
+
+    sing-box fakeip 模式下 DNS 返回的假 IP 必须被 proxy_worker 过滤，
+    否则应用会拿到不可路由的地址。默认范围 198.18.0.0/15。
+    """
+    path = Path(config_path) if config_path else _default_config_path()
+    if not path.is_file():
+        return ipaddress.IPv4Network("198.18.0.0/15")
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+        for server in config.get("dns", {}).get("servers", []):
+            if server.get("type") == "fakeip":
+                return ipaddress.IPv4Network(server["inet4_range"])
+    except Exception:
+        pass
+    return ipaddress.IPv4Network("198.18.0.0/15")

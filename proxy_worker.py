@@ -21,6 +21,7 @@ HypoMux 代理后端模块 - v2.0（SOCKS5 + HTTP 双协议无感接管）
 
 import asyncio
 import ctypes
+import ipaddress
 import ssl
 import random
 import socket
@@ -35,6 +36,22 @@ import psutil
 from PySide6.QtCore import QThread, Signal
 
 from utils.network_utils import get_adapter_if_indices
+from utils.singbox_config import PORT_ETHERNET, PORT_WIFI, PORT_AGGREGATION, read_fakeip_range
+
+
+# FakeIP 范围缓存：sing-box fakeip 模式下 DNS 返回的假 IP 必须过滤
+_fakeip_network = None
+
+
+def _is_fakeip(ip: str) -> bool:
+    """判断 IP 是否属于 FakeIP 范围（从 singbox-config.json 延迟读取）。"""
+    global _fakeip_network
+    if _fakeip_network is None:
+        _fakeip_network = read_fakeip_range()
+    try:
+        return ipaddress.IPv4Address(ip) in _fakeip_network
+    except Exception:
+        return False
 
 
 # RFC 1918 + 链路本地 私有地址段。跨子网 LAN 访问的必然失败不应扣 NIC 健康分。
@@ -1171,9 +1188,7 @@ class ProxyWorker(QThread):
 #   127.0.0.1:2002 -> 出站强制锁定【无线 Wi-Fi 网卡】（组内轮询）
 #   127.0.0.1:2003 -> 多网卡 Round-Robin 聚合叠加（全部选中网卡轮询）
 # 供 sing-box TUN 的三个 socks 出站对接，实现进程级分流 + 物理多卡叠加。
-PORT_ETHERNET = 2001
-PORT_WIFI = 2002
-PORT_AGGREGATION = 2003
+# PORT_ETHERNET / PORT_WIFI / PORT_AGGREGATION 从 singbox_config 导入
 
 # 网卡分组：有线 6 / PPP 拨号 23，其余（71 等）归为无线
 _IFTYPE_ETHERNET = 6
@@ -1546,7 +1561,7 @@ class MultiPortProxyWorker(QThread):
             offset += rdlength
             if rtype == 1 and rclass == 1 and rdlength == 4:
                 ip = socket.inet_ntoa(rdata)
-                if not ip.startswith("198.18.") and not ip.startswith("198.19."):
+                if not _is_fakeip(ip):
                     return ip
         raise ValueError("no A record")
 

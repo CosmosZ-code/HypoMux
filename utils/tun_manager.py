@@ -21,9 +21,10 @@ from typing import Optional
 
 from PySide6.QtCore import QThread, Signal
 
+from utils.singbox_config import TUN_INTERFACE_NAME, read_tun_gateway, SINGBOX_EXE
+
 # CREATE_NO_WINDOW：彻底隐藏 sing-box 控制台黑窗口
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-_TUN_INTERFACE_NAME = "HypoMux-Tun"
 
 
 def _is_winerror6_overlapped_cancel(context: dict) -> bool:
@@ -90,7 +91,7 @@ def _bin_dir() -> str:
 
 def get_singbox_path() -> Optional[str]:
     """解析 sing-box.exe 绝对路径；找不到返回 None。"""
-    candidate = os.path.join(_bin_dir(), "sing-box.exe")
+    candidate = os.path.join(_bin_dir(), SINGBOX_EXE)
     return candidate if os.path.isfile(candidate) else None
 
 
@@ -183,7 +184,7 @@ class TunManager(QThread):
 
         if stable_task in done and exit_task not in done and stop_task not in done:
             self.log_signal.emit(
-                f"[TUN] sing-box 内核已稳定运行，虚拟网卡 {_TUN_INTERFACE_NAME} 接管中"
+                f"[TUN] sing-box 内核已稳定运行，虚拟网卡 {TUN_INTERFACE_NAME} 接管中"
             )
             self.started_ok.emit(f"pid={self._proc.pid}")
             done, pending = await asyncio.wait(
@@ -262,7 +263,7 @@ class TunManager(QThread):
                 si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 si.wShowWindow = 0
             proc = await asyncio.create_subprocess_exec(
-                "taskkill", "/F", "/IM", "sing-box.exe", "/T",
+                "taskkill", "/F", "/IM", SINGBOX_EXE, "/T",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 startupinfo=si,
@@ -380,7 +381,7 @@ class TunManager(QThread):
                 si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 si.wShowWindow = 0
             subprocess.run(
-                ["taskkill", "/F", "/IM", "sing-box.exe", "/T"],
+                ["taskkill", "/F", "/IM", SINGBOX_EXE, "/T"],
                 capture_output=True, timeout=5, startupinfo=si,
                 creationflags=_CREATE_NO_WINDOW,
             )
@@ -401,7 +402,7 @@ class TunManager(QThread):
                 si.wShowWindow = 0
             # 删除 TUN 接管时可能写入的 0.0.0.0/0 经由 TUN 网关的残留默认路由
             subprocess.run(
-                ["route", "delete", "0.0.0.0", "mask", "0.0.0.0", "172.19.0.1"],
+                ["route", "delete", "0.0.0.0", "mask", "0.0.0.0", read_tun_gateway(self._config_path)],
                 capture_output=True, timeout=5, startupinfo=si,
                 creationflags=_CREATE_NO_WINDOW,
             )

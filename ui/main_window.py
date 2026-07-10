@@ -30,6 +30,7 @@ from utils.diagnostic_runner import run_diagnostic, DEFAULT_TARGET_IP
 from proxy_worker import ProxyWorker, MultiPortProxyWorker
 from utils.tun_manager import TunManager
 from utils import singbox_config
+from utils.singbox_config import read_tun_gateway, SINGBOX_EXE
 
 
 DEFAULT_SOCKS_PORT = 10800
@@ -274,6 +275,8 @@ def create_main_window():
             "log_steam_running": "[警告] 检测到 Steam 正在运行，请重启 Steam 客户端以使多链路加速完全生效。",
             "log_mode_changed": "[模式] 已切换为 {mode}",
             "log_tun_config_failed": "[TUN] 生成 sing-box 配置失败: {error}",
+            "log_tun_config_created": "[TUN] 首次生成 sing-box 配置: {path}",
+            "log_tun_config_updated": "[TUN] 配置已同步更新: {path}",
             "log_tun_dns_plan": "[TUN] DNS 上游: 系统自动出口 | 进程直连规则: {paths}",
             "log_tun_pool_ready": "[TUN] 出站池 ready: {info}",
             "log_tun_pool_failed": "[TUN] 出站池启动失败: {message}",
@@ -301,6 +304,8 @@ def create_main_window():
             "log_steam_running": "[Warning] Steam is running. Please restart the Steam client for multi-link acceleration to take full effect.",
             "log_mode_changed": "[Mode] Switched to {mode}",
             "log_tun_config_failed": "[TUN] Failed to generate sing-box config: {error}",
+            "log_tun_config_created": "[TUN] First-time sing-box config generated: {path}",
+            "log_tun_config_updated": "[TUN] Config synced: {path}",
             "log_tun_dns_plan": "[TUN] DNS upstream: automatic system outbound | Process direct rules: {paths}",
             "log_tun_pool_ready": "[TUN] Outbound pool ready: {info}",
             "log_tun_pool_failed": "[TUN] Outbound pool startup failed: {message}",
@@ -710,6 +715,8 @@ def create_main_window():
             self.home_page.set_card_checked(alias, checked)
             self.tools_page.set_card_checked(alias, checked)
             self._persist_config()
+            if self._tun_active:
+                self._regenerate_singbox_config()
 
         def on_select_all_clicked(self):
             self._checked_aliases = {a["alias"] for a in self._adapters}
@@ -863,22 +870,40 @@ def create_main_window():
                 self._regenerate_singbox_config()
 
         def _singbox_config_path(self):
-            # 固定写入 ~/.hypomux/singbox-config.json：该目录对当前用户始终可写，
-            # 且不依赖 __file__（onefile 打包态下 __file__ 会落到临时解包目录，
-            # 与 sys.executable 解析出的 bin 目录分叉）。sing-box 以绝对路径加载，
-            # 与工作目录无关。
             config_dir = Path.home() / ".hypomux"
             config_dir.mkdir(parents=True, exist_ok=True)
             return str(config_dir / "singbox-config.json")
 
-        def _regenerate_singbox_config(self) -> bool:
-            """据当前路由规则重新序列化 sing-box config.json。"""
+        def _ensure_singbox_config(self) -> bool:
+            """首次/文件缺失时生成配置，已有文件则原样使用。"""
+            config_path = self._singbox_config_path()
+            if Path(config_path).is_file():
+                return True
             try:
-                return singbox_config.generate_config_file(
+                ok = singbox_config.generate_config_file(
                     self._routing_rules,
-                    self._singbox_config_path(),
+                    config_path,
                     app_process_path=self._app_process_paths(),
                 )
+                if ok:
+                    self.append_log(mw_tr("log_tun_config_created", path=config_path))
+                return ok
+            except Exception as e:
+                self.append_log(mw_tr("log_tun_config_failed", error=e))
+                return False
+
+        def _regenerate_singbox_config(self) -> bool:
+            """面板设置变更时强制覆盖写入 sing-box 配置。"""
+            config_path = self._singbox_config_path()
+            try:
+                ok = singbox_config.generate_config_file(
+                    self._routing_rules,
+                    config_path,
+                    app_process_path=self._app_process_paths(),
+                )
+                if ok:
+                    self.append_log(mw_tr("log_tun_config_updated", path=config_path))
+                return ok
             except Exception as e:
                 self.append_log(mw_tr("log_tun_config_failed", error=e))
                 return False
@@ -964,7 +989,7 @@ def create_main_window():
             self.append_log(mw_tr("log_tun_pool_ready", info=info))
 
             # 2) 生成 sing-box 配置
-            if not self._regenerate_singbox_config():
+            if not self._ensure_singbox_config():
                 self._teardown_pool()
                 self._tun_starting = False
                 self._exit_boosting_ui()
@@ -1359,7 +1384,7 @@ def create_main_window():
                         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                         startupinfo.wShowWindow = 0
                     subprocess.run(
-                        ["taskkill", "/F", "/IM", "sing-box.exe", "/T"],
+                        ["taskkill", "/F", "/IM", SINGBOX_EXE, "/T"],
                         capture_output=True,
                         timeout=5,
                         startupinfo=startupinfo,
@@ -1367,7 +1392,7 @@ def create_main_window():
                     )
                     # 防御式清理：正常路径 force_kill 已删路由，此处兜底异常路径
                     subprocess.run(
-                        ["route", "delete", "0.0.0.0", "mask", "0.0.0.0", "172.19.0.1"],
+                        ["route", "delete", "0.0.0.0", "mask", "0.0.0.0", read_tun_gateway(self._singbox_config_path())],
                         capture_output=True,
                         timeout=5,
                         startupinfo=startupinfo,
