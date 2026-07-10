@@ -143,6 +143,8 @@ I18N_MAP = {
         "home_health_unknown": "未体检",
         "home_log_title": "实时网络日志",
         "home_card_ppp": "拨号",
+        "home_priority_label": "优先级",
+        "home_priority_tip": "网卡优先级 1~10，越小越优先。高优先级网卡变慢/超时时自动溢出到低优先级网卡",
 
         # === 路由规则页 ===
         "routing_title": "进程级分流规则",
@@ -351,6 +353,8 @@ I18N_MAP = {
         "home_health_unknown": "Not Checked",
         "home_log_title": "Live Network Log",
         "home_card_ppp": "Dial-up",
+        "home_priority_label": "Priority",
+        "home_priority_tip": "NIC priority 1~10, lower = higher priority. Auto-overflow to lower priority NICs when high-priority NIC becomes slow or times out",
 
         # === Routing Page ===
         "routing_title": "Per-Process Split Rules",

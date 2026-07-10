@@ -25,7 +25,7 @@ from typing import List, Dict
 import winreg
 
 from utils.network_utils import scan_network_adapters
-from utils.config_manager import load_config, save_config
+from utils.config_manager import load_config, save_config, get_adapter_priority, set_adapter_priority
 from utils.diagnostic_runner import run_diagnostic, DEFAULT_TARGET_IP
 from proxy_worker import ProxyWorker, MultiPortProxyWorker
 from utils.tun_manager import TunManager
@@ -583,6 +583,7 @@ def create_main_window():
             self.home_page.deselect_all_clicked.connect(self.on_deselect_all_clicked)
             self.home_page.refresh_clicked.connect(self.load_adapters)
             self.home_page.adapter_checked.connect(self.on_adapter_checked)
+            self.home_page.adapter_priority_changed.connect(self.on_adapter_priority_changed)
             self.home_page.mode_changed.connect(self.on_mode_changed)
             # 工具页（任务2：体检页也能勾选网卡，并入选择流）
             self.tools_page.start_clicked.connect(self.on_diagnose_clicked)
@@ -697,6 +698,7 @@ def create_main_window():
                 "routing_rules": self._routing_rules,
                 "dns_server": self._app_config.get("dns_server", "223.5.5.5"),
                 "doh_provider": self._app_config.get("doh_provider", "auto"),
+                "adapter_priorities": self._app_config.get("adapter_priorities", {}),
             }
 
         def _persist_config(self):
@@ -715,6 +717,18 @@ def create_main_window():
             self.home_page.set_card_checked(alias, checked)
             self.tools_page.set_card_checked(alias, checked)
             self._persist_config()
+            if self._tun_active:
+                self._regenerate_singbox_config()
+
+        def on_adapter_priority_changed(self, alias: str, priority: int):
+            """网卡优先级变更时立即持久化（加速中不允许修改，由 UI 层锁定控件）。"""
+            set_adapter_priority(alias, priority)
+            # 同步更新内存中的配置缓存
+            priorities = self._app_config.get("adapter_priorities", {})
+            if not isinstance(priorities, dict):
+                priorities = {}
+            priorities[alias] = priority
+            self._app_config["adapter_priorities"] = priorities
             if self._tun_active:
                 self._regenerate_singbox_config()
 
@@ -748,6 +762,7 @@ def create_main_window():
                     "iftype": a.get("iftype", -1),
                     "is_ppp": bool(a.get("is_ppp", False)),
                     "metric": a.get("metric", -1),
+                    "priority": get_adapter_priority(a["alias"]),
                 })
             return selected
 
@@ -774,6 +789,7 @@ def create_main_window():
             # 预先为每张网卡补一个 'ip' 字段（首个有效 IPv4），供卡片显示
             for a in self._adapters:
                 a["ip"] = _first_valid_ipv4(a.get("ipv4", ""))
+                a["priority"] = get_adapter_priority(a["alias"])
             # 仅保留仍存在的勾选别名
             existing = {a["alias"] for a in self._adapters}
             self._checked_aliases &= existing
@@ -884,6 +900,7 @@ def create_main_window():
                     self._routing_rules,
                     config_path,
                     app_process_path=self._app_process_paths(),
+                    selected_nics=self.get_selected_adapters(),
                 )
                 if ok:
                     self.append_log(mw_tr("log_tun_config_created", path=config_path))
